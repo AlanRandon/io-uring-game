@@ -1,4 +1,5 @@
 const std = @import("std");
+const Game = @import("./game.zig").Game;
 const net = std.net;
 const Allocator = std.mem.Allocator;
 
@@ -7,14 +8,23 @@ const c = @cImport({
     @cInclude("string.h");
 });
 
+test {
+    _ = .{@import("./game.zig")};
+    std.testing.refAllDeclsRecursive(@This());
+}
+
 const IoUring = struct {
     ring: c.io_uring,
     allocator: Allocator,
 
     const Event = union(enum) {
-        accept: struct { socket: std.posix.socket_t, addr: net.Address },
-        read: struct { socket: std.posix.socket_t, buf: []u8 },
-        write: struct { socket: std.posix.socket_t, buf: []u8 },
+        const Accept = struct { socket: std.posix.socket_t, addr: net.Address };
+        const Read = struct { socket: std.posix.socket_t, buf: []u8 };
+        const Write = struct { socket: std.posix.socket_t, buf: []u8 };
+
+        accept: Accept,
+        read: Read,
+        write: Write,
     };
 
     fn init(allocator: Allocator) !IoUring {
@@ -58,7 +68,7 @@ const IoUring = struct {
 
     fn submitRead(
         io_uring: *IoUring,
-        socket: std.posix.socket_t,
+        socket: std.posix.fd_t,
         buf: []u8,
     ) !void {
         const sqe = c.io_uring_get_sqe(&io_uring.ring);
@@ -73,7 +83,7 @@ const IoUring = struct {
 
     fn submitWrite(
         io_uring: *IoUring,
-        socket: std.posix.socket_t,
+        socket: std.posix.fd_t,
         buf: []u8,
     ) !void {
         const sqe = c.io_uring_get_sqe(&io_uring.ring);
@@ -116,50 +126,140 @@ const IoUring = struct {
     }
 };
 
+const Server = struct {
+    allocator: Allocator,
+    io_uring: IoUring,
+    rng: std.Random.DefaultPrng,
+    tcp: net.Server,
+    clients: std.AutoHashMap(std.posix.socket_t, *Client),
+    games: std.AutoHashMap(u64, *Game),
+
+    fn init(addr: net.Address, allocator: Allocator) !Server {
+        return .{
+            .allocator = allocator,
+            .io_uring = try IoUring.init(allocator),
+            .rng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp())),
+            .tcp = try addr.listen(.{ .reuse_address = true }),
+            .clients = std.AutoHashMap(std.posix.socket_t, *Client).init(allocator),
+            .games = std.AutoHashMap(u64, *Game).init(allocator),
+        };
+    }
+
+    fn deinit(server: *Server) void {
+        server.clients.deinit();
+        server.tcp.deinit();
+        server.games.deinit();
+        server.io_uring.deinit();
+    }
+
+    const RunError = Allocator.Error || error{ IoUringWait, IoUringNoUserData };
+
+    fn run(server: *Server) RunError!void {
+        try server.io_uring.submitAccept(server.tcp.stream.handle);
+        while (true) {
+            switch (try server.io_uring.waitEvent()) {
+                .event => |event| {
+                    defer server.allocator.destroy(event);
+                    switch (event.*) {
+                        .accept => |accept| {
+                            const client = try server.allocator.create(Client);
+                            client.* = .waiting_to_connect;
+                            try server.clients.put(accept.socket, client);
+
+                            try server.io_uring.submitAccept(server.tcp.stream.handle);
+                            const buf = try server.allocator.alloc(u8, @sizeOf(ConnectToGame));
+                            try server.io_uring.submitRead(accept.socket, buf);
+                        },
+                        .read => |read| {
+                            if (server.clients.get(read.socket)) |client| {
+                                try client.handle_event(server, read);
+                            }
+                        },
+                        .write => |write| {
+                            server.allocator.free(write.buf);
+                        },
+                    }
+                },
+                .fail => |result| {
+                    // Handle cleanup on errors (e.g. disconnects)
+                    defer server.allocator.destroy(result.event);
+                    switch (result.event.*) {
+                        .read => |read| {
+                            if (server.clients.fetchRemove(read.socket)) |client| {
+                                server.allocator.destroy(client.value);
+                            }
+
+                            server.allocator.free(read.buf);
+                        },
+                        .write => |write| {
+                            if (server.clients.fetchRemove(write.socket)) |client| {
+                                server.allocator.destroy(client.value);
+                            }
+
+                            server.allocator.free(write.buf);
+                        },
+                        else => {},
+                    }
+                },
+            }
+        }
+    }
+};
+
+const Client = union(enum) {
+    waiting_to_connect,
+    waiting_for_peer: *Game,
+    playing: *Game,
+
+    fn handle_event(client: *Client, server: *Server, event: IoUring.Event.Read) Server.RunError!void {
+        switch (client.*) {
+            .waiting_to_connect => {
+                defer server.allocator.free(event.buf);
+
+                var id: u64 = undefined;
+                const connect_to_game: *ConnectToGame = @ptrCast(@alignCast(event.buf));
+                if (connect_to_game.game_id) |desired_id| {
+                    if (server.games.get(desired_id)) |game| {
+                        id = desired_id;
+                        _ = game;
+                    } else {
+                        std.log.err("TODO: game id not exists", .{});
+                        return;
+                    }
+                } else {
+                    while (true) {
+                        id = server.rng.next();
+                        if (!server.games.contains(id)) {
+                            const game = try server.allocator.create(Game);
+                            game.* = Game.init();
+                            try server.games.put(id, game);
+
+                            client.* = .{ .waiting_for_peer = game };
+
+                            break;
+                        }
+                    }
+                }
+
+                const response = try server.allocator.alloc(u8, @sizeOf(ConnectedToGame));
+                @as(*ConnectedToGame, @ptrCast(@alignCast(response))).* = ConnectedToGame{ .id = id };
+                try server.io_uring.submitWrite(event.socket, response);
+            },
+            else => {},
+        }
+    }
+};
+
+const ConnectToGame = struct { game_id: ?u64 };
+const ConnectedToGame = struct { id: u64 };
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
     const addr = net.Address{ .in = try net.Ip4Address.parse("127.0.0.1", 8080) };
-    const server = try addr.listen(.{ .reuse_address = true });
+    var server = try Server.init(addr, allocator);
+    defer server.deinit();
 
-    var io_uring = try IoUring.init(allocator);
-    defer io_uring.deinit();
-
-    try io_uring.submitAccept(server.stream.handle);
-    while (true) {
-        switch (try io_uring.waitEvent()) {
-            .event => |event| {
-                defer allocator.destroy(event);
-                switch (event.*) {
-                    .accept => |accept| {
-                        try io_uring.submitAccept(server.stream.handle);
-                        const buf = try allocator.alloc(u8, 1);
-                        try io_uring.submitRead(accept.socket, buf);
-                    },
-                    .read => |read| {
-                        // std.log.debug("Read {s}", .{read.buf});
-                        try io_uring.submitWrite(read.socket, read.buf);
-                    },
-                    .write => |write| {
-                        try io_uring.submitRead(write.socket, write.buf);
-                    },
-                }
-            },
-            .fail => |result| {
-                // Handle cleanup on errors (e.g. disconnects)
-                // std.log.info("{s}", .{c.strerror(result.code)});
-                switch (result.event.*) {
-                    .read => |read| {
-                        allocator.free(read.buf);
-                    },
-                    .write => |write| {
-                        allocator.free(write.buf);
-                    },
-                    else => {},
-                }
-                allocator.destroy(result.event);
-            },
-        }
-    }
+    try server.run();
 }
