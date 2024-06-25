@@ -69,6 +69,7 @@ pub fn main() !void {
             move = .{ .player = player, .subgrid = subgrid, .cell = cell };
 
             try connection.writeAll(bytesConst(protocol.Move, &move));
+            try stdout.print("Sent\n", .{});
         }
 
         var move_result: protocol.MoveResult = undefined;

@@ -189,7 +189,7 @@ pub const Game = struct {
                                         .o => try writer.writeAll("o"),
                                     }
                                 } else {
-                                    try writer.print("{}", .{cell});
+                                    try writer.writeAll(" ");
                                 }
                             }
                         },

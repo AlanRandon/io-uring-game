@@ -3,8 +3,10 @@ const protocol = @import("./protocol.zig");
 const net = std.net;
 const IoUring = @import("./io_uring.zig").IoUring;
 const Game = @import("./game.zig").Game;
+const Player = @import("./game.zig").Player;
 const Allocator = std.mem.Allocator;
 const socket_t = std.posix.socket_t;
+const assert = std.debug.assert;
 
 test {
     _ = .{
@@ -17,14 +19,14 @@ test {
 
 const Server = struct {
     const ClientMap = std.AutoHashMap(socket_t, *Client);
-    const GameMap = std.AutoHashMap(u64, *GameSlot);
+    const WaitingClients = std.AutoHashMap(u64, *Client);
 
     allocator: Allocator,
     io_uring: IoUring,
     rng: std.Random.DefaultPrng,
     tcp: net.Server,
     clients: ClientMap,
-    games: GameMap,
+    waiting_clients: WaitingClients,
 
     fn init(addr: net.Address, allocator: Allocator) !Server {
         return .{
@@ -33,14 +35,14 @@ const Server = struct {
             .rng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp())),
             .tcp = try addr.listen(.{ .reuse_address = true }),
             .clients = ClientMap.init(allocator),
-            .games = GameMap.init(allocator),
+            .waiting_clients = WaitingClients.init(allocator),
         };
     }
 
     fn deinit(server: *Server) void {
         server.clients.deinit();
+        server.waiting_clients.deinit();
         server.tcp.deinit();
-        server.games.deinit();
         server.io_uring.deinit();
     }
 
@@ -67,16 +69,18 @@ const Server = struct {
                         .read => |read| {
                             defer server.allocator.free(read.buf);
                             if (server.clients.get(read.fd)) |client| {
-                                try client.handle_message(server, read.buf);
+                                try client.handleMessage(server, read.buf);
                             }
                         },
                         .write => |write| {
                             defer server.allocator.free(write.buf);
                             if (server.clients.get(write.fd)) |client| {
-                                try client.handle_message(server, write.buf);
+                                try client.handleMessage(server, write.buf);
                             }
                         },
-                        .close => {},
+                        .close => |close| {
+                            std.log.info("Closed {}", .{close.fd});
+                        },
                     }
                 },
                 .fail => |result| {
@@ -104,192 +108,176 @@ const Server = struct {
     }
 
     fn writeAny(server: *Server, socket: socket_t, data: anytype) !void {
-        const response = try server.allocator.alignedAlloc(
-            u8,
-            @alignOf(@TypeOf(data)),
-            @sizeOf(@TypeOf(data)),
-        );
+        const response = try server.allocator.alignedAlloc(u8, @alignOf(@TypeOf(data)), @sizeOf(@TypeOf(data)));
         @as(*@TypeOf(data), @ptrCast(response)).* = data;
-        // std.debug.print("{s} {any}\n", .{ @typeName(@TypeOf(data)), response });
         try server.io_uring.submitWrite(socket, response, server.allocator);
     }
 
     fn destroyClient(server: *Server, client: *Client) !void {
-        switch (client.state) {
-            .playing => |playing| {
-                defer server.allocator.destroy(playing.game);
-                switch (playing.game.state) {
-                    .waiting => {
-                        defer server.allocator.destroy(client);
-                        _ = server.clients.remove(client.socket);
-                        try server.io_uring.submitClose(client.socket, server.allocator);
-                    },
-                    .playing => |game| {
-                        for (game.clients) |c| {
-                            defer server.allocator.destroy(c);
-                            _ = server.clients.remove(c.socket);
-                            try server.io_uring.submitClose(c.socket, server.allocator);
-                        }
-                        _ = server.games.remove(playing.game.id);
-                    },
-                }
-            },
-            .reading_connect, .writing_connected => {
-                defer server.allocator.destroy(client);
-                _ = server.clients.remove(client.socket);
-                try server.io_uring.submitClose(client.socket, server.allocator);
-            },
-        }
-    }
-};
-
-const GameSlot = struct {
-    const Playing = struct {
-        clients: [2]*Client,
-        game: Game,
-    };
-
-    id: u64,
-    state: union(enum) {
-        waiting: *Client,
-        playing: Playing,
-    },
-
-    fn join(slot: *GameSlot, player: *Client) !void {
-        switch (slot.state) {
-            .waiting => |p| {
-                slot.state = .{ .playing = .{
-                    .game = Game.init(),
-                    .clients = [2]*Client{ p, player },
-                } };
-            },
-            .playing => {
-                return error.GameFull;
-            },
+        if (client.getPlayingState()) |g| {
+            const game = g.*;
+            defer server.allocator.destroy(game.game);
+            for ([_]*Client{ client, game.opponent }) |c| {
+                defer server.allocator.destroy(c);
+                _ = server.clients.remove(c.socket);
+                try server.io_uring.submitClose(c.socket, server.allocator);
+            }
+        } else {
+            defer server.allocator.destroy(client);
+            _ = server.clients.remove(client.socket);
+            try server.io_uring.submitClose(client.socket, server.allocator);
         }
     }
 };
 
 const Client = struct {
+    const PlayingState = struct {
+        game: *Game,
+        opponent: *Client,
+        player: Player,
+    };
+
     state: union(enum) {
         reading_connect,
-        writing_connected,
-        playing: struct {
-            game: *GameSlot,
-            player: @import("./game.zig").Player,
-            state: enum { writing_started, writing_move_result, reading_move },
-        },
+        writing_connected_error,
+        writing_connected_waiting,
+        writing_connected_joined: PlayingState,
+        writing_started: PlayingState,
+        writing_move_result: PlayingState,
+        reading_move: PlayingState,
     },
     socket: socket_t,
 
-    fn handle_message(client: *Client, server: *Server, buf: []u8) !void {
+    fn getPlayingState(client: *Client) ?*PlayingState {
+        return switch (client.state) {
+            .writing_connected_joined, .writing_started, .writing_move_result, .reading_move => |*game| game,
+            .reading_connect, .writing_connected_error, .writing_connected_waiting => null,
+        };
+    }
+
+    fn connectRead(client: *Client, server: *Server, connect: protocol.Connect) !void {
+        switch (connect) {
+            .join => |join| {
+                if (server.waiting_clients.fetchRemove(join.id)) |opponent| {
+                    const game = try server.allocator.create(Game);
+                    game.* = Game.init();
+
+                    const players = if (server.rng.next() % 2 == 0) [2]Player{ .x, .o } else [2]Player{ .o, .x };
+
+                    client.state = .{ .writing_connected_joined = .{
+                        .game = game,
+                        .opponent = opponent.value,
+                        .player = players[0],
+                    } };
+
+                    opponent.value.state = .{ .writing_connected_joined = .{
+                        .game = game,
+                        .opponent = client,
+                        .player = players[1],
+                    } };
+
+                    try server.writeAny(client.socket, protocol.Connected{ .success = .{ .id = join.id } });
+                } else {
+                    client.state = .writing_connected_error;
+
+                    try server.writeAny(client.socket, protocol.Connected{ .err = .game_not_exists });
+                }
+            },
+            .create => {
+                client.state = .writing_connected_waiting;
+
+                var id: u64 = undefined;
+                while (true) {
+                    id = server.rng.next();
+                    if (!server.waiting_clients.contains(id)) {
+                        try server.waiting_clients.put(id, client);
+
+                        try server.writeAny(client.socket, protocol.Connected{ .success = .{ .id = id } });
+                        return;
+                    }
+                }
+            },
+        }
+    }
+
+    fn moveRead(client: *Client, server: *Server, move: protocol.Move, game: PlayingState) !void {
+        client.state = .{ .writing_move_result = game };
+
+        const winner = game.game.tryMove(move) catch |err| switch (err) {
+            error.InvalidMove => {
+                const move_result: protocol.MoveResult = protocol.MoveResult.invalid_move;
+                try server.writeAny(client.socket, move_result);
+                return;
+            },
+        };
+
+        if (winner) |w| {
+            std.log.info("Winner: {}", .{w});
+            try server.destroyClient(client);
+            return;
+        }
+
+        game.opponent.state = .{ .writing_move_result = game.opponent.getPlayingState().?.* };
+        try server.writeAny(client.socket, protocol.MoveResult{ .move = move });
+        try server.writeAny(game.opponent.socket, protocol.MoveResult{ .move = move });
+    }
+
+    fn handleMessage(client: *Client, server: *Server, buf: []u8) !void {
         switch (client.state) {
             .reading_connect => {
+                assert(buf.len == @sizeOf(protocol.Connect));
                 const connect: *protocol.Connect = @ptrCast(@alignCast(buf));
-                client.state = .writing_connected;
                 std.log.info("Read connect: {} {}", .{ client.socket, connect });
-
-                switch (connect.*) {
-                    .join => |join| {
-                        if (server.games.get(join.id)) |game| {
-                            game.join(client) catch |err| switch (err) {
-                                error.GameFull => {
-                                    try server.writeAny(client.socket, protocol.Connected{ .err = .game_full });
-                                    return;
-                                },
-                            };
-
-                            try server.writeAny(client.socket, protocol.Connected{ .success = .{ .id = join.id } });
-                        } else {
-                            try server.writeAny(client.socket, protocol.Connected{ .err = .game_not_exists });
-                        }
-                    },
-                    .create => {
-                        var id: u64 = undefined;
-                        while (true) {
-                            id = server.rng.next();
-                            if (!server.games.contains(id)) {
-                                const slot = try server.allocator.create(GameSlot);
-                                slot.* = .{ .state = .{ .waiting = client }, .id = id };
-                                try server.games.put(id, slot);
-
-                                try server.writeAny(client.socket, protocol.Connected{ .success = .{ .id = id } });
-                                return;
-                            }
-                        }
-                    },
-                }
+                try client.connectRead(server, connect.*);
             },
-            .writing_connected => {
+            .writing_connected_error => {
+                assert(buf.len == @sizeOf(protocol.Connected));
                 const connected: *protocol.Connected = @ptrCast(@alignCast(buf));
-                std.log.info("Wrote connected: {} {}", .{ client.socket, connected });
+                std.log.info("Wrote connected (errored): {} {}", .{ client.socket, connected });
+                try server.destroyClient(client);
+            },
+            .writing_connected_waiting => {
+                assert(buf.len == @sizeOf(protocol.Connected));
+                const connected: *protocol.Connected = @ptrCast(@alignCast(buf));
+                std.log.info("Wrote connected (waiting): {} {}", .{ client.socket, connected });
+            },
+            .writing_connected_joined => |game| {
+                assert(buf.len == @sizeOf(protocol.Connected));
+                const connected: *protocol.Connected = @ptrCast(@alignCast(buf));
+                std.log.info("Wrote connected (joined): {} {}", .{ client.socket, connected });
 
-                switch (connected.*) {
-                    .success => |success| {
-                        if (server.games.get(success.id)) |game| {
-                            switch (game.state) {
-                                .playing => |playing| {
-                                    inline for (playing.clients, .{ .x, .o }) |c, p| {
-                                        c.state = .{ .playing = .{ .state = .writing_started, .game = game, .player = p } };
-                                        try server.writeAny(c.socket, protocol.Started{ .player = p });
-                                    }
-                                },
-                                else => {},
-                            }
-                        }
-                    },
-                    .err => {
-                        try server.destroyClient(client);
-                    },
+                inline for (.{ client, game.opponent }) |c| {
+                    const state = c.state.writing_connected_joined;
+                    c.state = .{ .writing_started = state };
+                    try server.writeAny(c.socket, protocol.Started{ .player = state.player });
                 }
             },
-            .playing => |*playing| {
-                const game = &playing.game.state.playing;
-                switch (playing.state) {
-                    .writing_started => {
-                        const started: *protocol.Started = @ptrCast(@alignCast(buf));
-                        std.log.info("Wrote started: {} {}", .{ client.socket, started });
+            .writing_started => |game| {
+                assert(buf.len == @sizeOf(protocol.Started));
+                const started: *protocol.Started = @ptrCast(@alignCast(buf));
+                std.log.info("Wrote started: {} {}", .{ client.socket, started });
 
-                        if (game.game.nextMovePlayer == playing.player) {
-                            playing.state = .reading_move;
-                            const move_buf = try server.allocator.alloc(u8, @sizeOf(protocol.Move));
-                            try server.io_uring.submitRead(client.socket, move_buf, server.allocator);
-                        }
-                    },
-                    .reading_move => {
-                        const m: *protocol.Move = @ptrCast(@alignCast(buf));
-                        std.log.info("Read move: {} {}", .{ client.socket, m });
+                if (game.game.nextMovePlayer == game.player) {
+                    client.state = .{ .reading_move = game };
+                    const move_buf = try server.allocator.alloc(u8, @sizeOf(protocol.Move));
+                    try server.io_uring.submitRead(client.socket, move_buf, server.allocator);
+                }
+            },
+            .reading_move => |game| {
+                assert(buf.len == @sizeOf(protocol.Move));
+                const move: *protocol.Move = @ptrCast(@alignCast(buf));
+                std.log.info("Read move: {} {}", .{ client.socket, move });
+                try client.moveRead(server, move.*, game);
+            },
+            .writing_move_result => |game| {
+                assert(buf.len == @sizeOf(protocol.MoveResult));
+                const move: *protocol.MoveResult = @ptrCast(@alignCast(buf));
+                std.log.info("Wrote move result: {} {}", .{ client.socket, move });
 
-                        const winner = game.game.tryMove(m.*) catch |err| switch (err) {
-                            error.InvalidMove => {
-                                client.state.playing.state = .writing_move_result;
-                                const move_result: protocol.MoveResult = protocol.MoveResult.invalid_move;
-                                try server.writeAny(client.socket, move_result);
-                                std.log.info("Writing move result: {} {}", .{ client.socket, move_result });
-                                return;
-                            },
-                        };
-
-                        if (winner) |w| {
-                            std.log.info("Winner: {}", .{w});
-                        }
-
-                        inline for (game.clients) |c| {
-                            const p = &c.state.playing;
-                            p.state = .writing_move_result;
-                            try server.writeAny(c.socket, protocol.MoveResult{ .move = m.* });
-                        }
-                    },
-                    .writing_move_result => {
-                        const move: *protocol.MoveResult = @ptrCast(@alignCast(buf));
-                        std.log.info("Wrote move result: {} {}", .{ client.socket, move });
-
-                        if (game.game.nextMovePlayer == playing.player) {
-                            playing.state = .reading_move;
-                            const move_buf = try server.allocator.alloc(u8, @sizeOf(protocol.Move));
-                            try server.io_uring.submitRead(client.socket, move_buf, server.allocator);
-                        }
-                    },
+                if (game.game.nextMovePlayer == game.player) {
+                    client.state = .{ .reading_move = game };
+                    const move_buf = try server.allocator.alloc(u8, @sizeOf(protocol.Move));
+                    try server.io_uring.submitRead(client.socket, move_buf, server.allocator);
                 }
             },
         }
