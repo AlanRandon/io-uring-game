@@ -200,10 +200,11 @@ const Client = struct {
         }
     }
 
-    fn moveRead(client: *Client, server: *Server, move: protocol.Move, game: PlayingState) !void {
+    fn moveRead(client: *Client, server: *Server, move: *protocol.Move, game: PlayingState) !void {
+        move.player = client.getPlayingState().?.player;
         client.state = .{ .writing_move_result = game };
 
-        const winner = game.game.tryMove(move) catch |err| switch (err) {
+        const winner = game.game.tryMove(move.*) catch |err| switch (err) {
             error.InvalidMove => {
                 const move_result: protocol.MoveResult = protocol.MoveResult.invalid_move;
                 try server.writeAny(client.socket, move_result);
@@ -218,8 +219,8 @@ const Client = struct {
         }
 
         game.opponent.state = .{ .writing_move_result = game.opponent.getPlayingState().?.* };
-        try server.writeAny(client.socket, protocol.MoveResult{ .move = move });
-        try server.writeAny(game.opponent.socket, protocol.MoveResult{ .move = move });
+        try server.writeAny(client.socket, protocol.MoveResult{ .move = move.* });
+        try server.writeAny(game.opponent.socket, protocol.MoveResult{ .move = move.* });
     }
 
     fn handleMessage(client: *Client, server: *Server, buf: []u8) !void {
@@ -267,7 +268,7 @@ const Client = struct {
                 assert(buf.len == @sizeOf(protocol.Move));
                 const move: *protocol.Move = @ptrCast(@alignCast(buf));
                 std.log.info("Read move: {} {}", .{ client.socket, move });
-                try client.moveRead(server, move.*, game);
+                try client.moveRead(server, move, game);
             },
             .writing_move_result => |game| {
                 assert(buf.len == @sizeOf(protocol.MoveResult));

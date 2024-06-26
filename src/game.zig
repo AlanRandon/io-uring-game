@@ -154,7 +154,7 @@ pub const Game = struct {
             .x => .o,
         };
 
-        switch (game.grid[move.subgrid]) {
+        switch (game.grid[move.cell]) {
             .playing => {
                 game.nextMoveSubgrid = move.cell;
             },
@@ -164,53 +164,6 @@ pub const Game = struct {
         }
 
         return null;
-    }
-
-    pub fn format(
-        self: Game,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-
-        try writer.writeAll("+---" ** 3 ++ "+\n");
-        for (0..3) |subgrid_offset| {
-            for (0..3) |row_offset| {
-                try writer.writeAll("|");
-                for (0 + subgrid_offset * 3..3 + subgrid_offset * 3) |subgrid| {
-                    switch (self.grid[subgrid]) {
-                        .playing => |playing| {
-                            for (0 + row_offset * 3..3 + row_offset * 3) |cell| {
-                                if (playing[cell]) |c| {
-                                    switch (c) {
-                                        .x => try writer.writeAll("x"),
-                                        .o => try writer.writeAll("o"),
-                                    }
-                                } else {
-                                    try writer.writeAll(" ");
-                                }
-                            }
-                        },
-                        .won => |c| {
-                            if (row_offset == 1) {
-                                try writer.print(" {s} ", .{switch (c) {
-                                    .x => "x",
-                                    .o => "o",
-                                }});
-                            } else {
-                                try writer.writeAll("   ");
-                            }
-                        },
-                    }
-                    try writer.writeAll("|");
-                }
-
-                try writer.writeAll("\n");
-            }
-            try writer.writeAll("+---" ** 3 ++ "+\n");
-        }
     }
 };
 
